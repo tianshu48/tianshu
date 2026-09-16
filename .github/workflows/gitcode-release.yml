@@ -16,47 +16,87 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: Install GitCode CLI
-        run: npm install -g @gitcode-cli/cli
       - name: Sync GitHub release(s) to GitCode
         env:
-          GC_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
-          test -n "${GC_TOKEN:-}"
+          test -n "${GITCODE_TOKEN:-}"
+          API="https://api.gitcode.com/api/v5"
+          enc() { jq -nr --arg v "$1" '$v|@uri'; }
+          gitcode_get() {
+            curl -fsS --retry 4 --retry-all-errors \
+              -H "Authorization: Bearer ${GITCODE_TOKEN}" \
+              "$1"
+          }
+          existing_names() {
+            local tag="$1"
+            gitcode_get "${API}/repos/${GITHUB_REPOSITORY}/releases/tags/$(enc "$tag")" \
+              | jq -r '.assets[]?.name // empty' || true
+          }
+          upload_file() {
+            local tag="$1" file="$2"
+            local filename upload_json url
+            filename="$(basename "$file")"
+            echo "upload $filename ($(wc -c <"$file") bytes)"
+            upload_json="$(mktemp)"
+            curl -fsS --retry 4 --retry-all-errors \
+              -H "Authorization: Bearer ${GITCODE_TOKEN}" \
+              -o "$upload_json" \
+              "${API}/repos/${GITHUB_REPOSITORY}/releases/$(enc "$tag")/upload_url?file_name=$(enc "$filename")"
+            url="$(jq -r .url "$upload_json")"
+            test -n "$url" && test "$url" != null
+            curl -fsS --retry 4 --retry-all-errors \
+              --connect-timeout 30 --max-time 900 \
+              -X PUT \
+              -H "x-obs-meta-project-id: $(jq -r '.headers["x-obs-meta-project-id"]' "$upload_json")" \
+              -H "x-obs-acl: $(jq -r '.headers["x-obs-acl"]' "$upload_json")" \
+              -H "x-obs-callback: $(jq -r '.headers["x-obs-callback"]' "$upload_json")" \
+              -H "Content-Type: $(jq -r '.headers["Content-Type"]' "$upload_json")" \
+              --upload-file "$file" \
+              "$url"
+            echo "uploaded $filename"
+          }
           sync_one() {
-            local tag="$1" dir title pre
+            local tag="$1" dir title pre body payload have
             dir="$(mktemp -d)"
-            gh release view "$tag" -R "$GITHUB_REPOSITORY" --json name,body,isPrerelease,tagName,isDraft >"$dir/meta.json"
+            gh release view "$tag" -R "$GITHUB_REPOSITORY" --json name,body,isPrerelease,tagName,isDraft,targetCommitish >"$dir/meta.json"
             if [ "$(jq -r .isDraft "$dir/meta.json")" = true ]; then
               echo "skip draft $tag"
               return 0
             fi
-            jq -r '.body // ""' "$dir/meta.json" >"$dir/notes.md"
             title="$(jq -r .name "$dir/meta.json")"
+            body="$(jq -r '.body // ""' "$dir/meta.json")"
             pre="$(jq -r .isPrerelease "$dir/meta.json")"
-            extra=()
-            if [ "$pre" = true ]; then extra+=(--prerelease); fi
-            if gc --no-interactive release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "GitCode release $tag already exists"
+            jq -n --arg tag "$tag" --arg name "$title" --arg body "$body" --arg pre "$pre" \
+              '{tag_name:$tag,name:$name,body:$body,release_status:(if $pre=="true" then "pre" else "latest" end)}' \
+              >"$dir/create.json"
+            if gitcode_get "${API}/repos/${GITHUB_REPOSITORY}/releases/tags/$(enc "$tag")" >/dev/null 2>&1; then
+              echo "GitCode release $tag exists"
             else
-              gc --no-interactive release create "$tag" -R "$GITHUB_REPOSITORY" \
-                --title "$title" --notes-file "$dir/notes.md" "${extra[@]}"
+              curl -fsS --retry 4 --retry-all-errors \
+                -H "Authorization: Bearer ${GITCODE_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d @"$dir/create.json" \
+                -X POST "${API}/repos/${GITHUB_REPOSITORY}/releases"
+              echo
+              echo "created GitCode release $tag"
             fi
             mkdir -p "$dir/assets"
             gh release download "$tag" -R "$GITHUB_REPOSITORY" -D "$dir/assets" --clobber
+            have="$(existing_names "$tag")"
             shopt -s nullglob
-            local files=("$dir/assets"/*)
-            if [ "${#files[@]}" -eq 0 ]; then
-              echo "no assets for $tag"
-              return 0
-            fi
-            gc --no-interactive release upload "$tag" -R "$GITHUB_REPOSITORY" "${files[@]}" || true
+            local f filename
+            for f in "$dir/assets"/*; do
+              filename="$(basename "$f")"
+              if printf '%s\n' "$have" | grep -Fxq "$filename"; then
+                echo "skip existing $filename"
+                continue
+              fi
+              upload_file "$tag" "$f"
+            done
           }
           if [ -n "${TAG:-}" ]; then
             sync_one "$TAG"
