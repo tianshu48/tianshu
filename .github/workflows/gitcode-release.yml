@@ -1,0 +1,68 @@
+name: Mirror releases to GitCode
+
+on:
+  release:
+    types: [published, edited, released, prereleased]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to sync (empty = every GitHub release)"
+        required: false
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install GitCode CLI
+        run: npm install -g @gitcode-cli/cli
+      - name: Sync GitHub release(s) to GitCode
+        env:
+          GC_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          test -n "${GC_TOKEN:-}"
+          sync_one() {
+            local tag="$1" dir title pre
+            dir="$(mktemp -d)"
+            gh release view "$tag" -R "$GITHUB_REPOSITORY" --json name,body,isPrerelease,tagName,isDraft >"$dir/meta.json"
+            if [ "$(jq -r .isDraft "$dir/meta.json")" = true ]; then
+              echo "skip draft $tag"
+              return 0
+            fi
+            jq -r '.body // ""' "$dir/meta.json" >"$dir/notes.md"
+            title="$(jq -r .name "$dir/meta.json")"
+            pre="$(jq -r .isPrerelease "$dir/meta.json")"
+            extra=()
+            if [ "$pre" = true ]; then extra+=(--prerelease); fi
+            if gc --no-interactive release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "GitCode release $tag already exists"
+            else
+              gc --no-interactive release create "$tag" -R "$GITHUB_REPOSITORY" \
+                --title "$title" --notes-file "$dir/notes.md" "${extra[@]}"
+            fi
+            mkdir -p "$dir/assets"
+            gh release download "$tag" -R "$GITHUB_REPOSITORY" -D "$dir/assets" --clobber
+            shopt -s nullglob
+            local files=("$dir/assets"/*)
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "no assets for $tag"
+              return 0
+            fi
+            gc --no-interactive release upload "$tag" -R "$GITHUB_REPOSITORY" "${files[@]}" || true
+          }
+          if [ -n "${TAG:-}" ]; then
+            sync_one "$TAG"
+          else
+            mapfile -t tags < <(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName')
+            for t in "${tags[@]}"; do
+              sync_one "$t"
+            done
+          fi
